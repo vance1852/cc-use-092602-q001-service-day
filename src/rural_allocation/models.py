@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .clock import parse_utc
 from .errors import ValidationFailed
@@ -113,6 +114,10 @@ class Facility:
         timezone = required_text(raw.get("timezone"), "timezone", 64)
         if "/" not in timezone and timezone != "UTC":
             raise ValidationFailed("timezone 必须是 IANA 时区或 UTC")
+        try:
+            ZoneInfo(timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ValidationFailed(f"timezone {timezone} 不在时区数据库中") from exc
         return cls(
             facility_id=identifier(raw.get("facility_id"), "facility_id"),
             name=required_text(raw.get("name"), "name"),

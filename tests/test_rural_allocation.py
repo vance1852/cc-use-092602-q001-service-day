@@ -8,7 +8,7 @@ from decimal import Decimal
 
 from rural_allocation.api import JsonApplication
 from rural_allocation.clock import FrozenClock
-from rural_allocation.errors import Conflict, Forbidden
+from rural_allocation.errors import Conflict, Forbidden, ValidationFailed
 from rural_allocation.planning import AllocationRequest, PricePoint, allocate_capacity, latest_streak
 from rural_allocation.service import SupplyService
 from rural_allocation.risk import DemandBucket, inventory_coverage, mark_to_market, supply_gap
@@ -98,12 +98,72 @@ class SupplyServiceTests(unittest.TestCase):
         for number, requested, priority in ((1, "40000", 10), (2, "30000", 20)):
             self.service.submit_nomination("dispatch", {"nomination_id": f"nom-{number}", "route_id": "pool-a-b", "shipper_id": f"shipper-{number}", "service_date": "2026-09-25", "requested_mu": requested, "priority": priority, "idempotency_key": f"key-{number}"})
         allocation = self.service.allocate("dispatch", "pool-a-b", "2026-09-25")
-        self.assertEqual(allocation["available_capacity"], "50000.000")
-        self.assertEqual(allocation["allocations"][1]["allocated_mu"], "10000.000")
+        # 业务日按安置片区时区 Asia/Shanghai 折算，停用时段只与业务日重叠 16 小时
+        self.assertEqual(allocation["available_capacity"], "66666.667")
+        self.assertEqual(allocation["allocations"][1]["allocated_mu"], "26666.667")
         self.service.add_inventory_lot("dispatch", {"lot_id": "lot-1", "facility_id": "village-a", "product": "cultivated-land", "grade": "PEAK_VALLEY", "quantity_mu": "60000", "unit_cost_cny": "91", "received_at": "2026-09-24T06:00:00Z"})
         transfer = self.service.dispatch_transfer("dispatch", "transfer-1", "nom-1", "lot-1", 2)
         self.assertEqual(transfer["surveyed_mu"], "40000.000")
         self.assertEqual(self.service.inventory_lot("lot-1")["available_mu"], "20000.000")
+
+    def test_business_day_follows_settlement_timezone(self) -> None:
+        self.service.create_facility("plan", {"facility_id": "kashgar-camp", "name": "喀什安置片区", "kind": "settlement", "timezone": "Asia/Urumqi", "capacity_mu": "300000"})
+        self.service.create_route("plan", {"route_id": "pool-a-kashgar", "origin_id": "village-a", "destination_id": "kashgar-camp", "product": "cultivated-land", "daily_capacity": "24000", "loss_basis_points": 0, "transit_hours": 48})
+        # 喀什当地 2026-09-24 23:00 至 2026-09-25 01:00（Asia/Urumqi，UTC+6）的跨午夜停用
+        self.service.announce_outage("risk", "pool-a-kashgar", "2026-09-24T17:00:00Z", "2026-09-24T19:00:00Z", "0", "夜间检修")
+        first = self.service.capacity_preview("dispatch", "pool-a-kashgar", "2026-09-24")
+        second = self.service.capacity_preview("dispatch", "pool-a-kashgar", "2026-09-25")
+        self.assertEqual(first["timezone"], "Asia/Urumqi")
+        self.assertEqual(first["business_day_starts_at"], "2026-09-23T18:00:00Z")
+        self.assertEqual(second["business_day_starts_at"], "2026-09-24T18:00:00Z")
+        # 跨日限制在两个自然日各只扣减真正重叠的一小时
+        self.assertEqual(first["available_capacity"], "23000.000")
+        self.assertEqual(second["available_capacity"], "23000.000")
+        self.assertEqual(first["nominal_capacity"], "24000.000")
+        self.assertEqual(len(second["outages"]), 1)
+        self.assertEqual(second["outages"][0]["overlap_seconds"], "3600")
+        self.assertEqual(second["outages"][0]["deducted_mu"], "1000.000")
+
+    def test_open_ended_outage_keeps_full_day_effect(self) -> None:
+        self.service.announce_outage("risk", "pool-a-b", "2026-09-20T00:00:00Z", None, "25", "长期限电")
+        for day in ("2026-09-25", "2026-09-26"):
+            preview = self.service.capacity_preview("dispatch", "pool-a-b", day)
+            self.assertEqual(preview["available_capacity"], "25000.000")
+            self.assertEqual(preview["deducted_capacity"], "75000.000")
+            self.assertEqual(preview["outages"][0]["overlap_seconds"], "86400")
+
+    def test_allocate_replays_and_never_rewrites_confirmed_run(self) -> None:
+        self.service.submit_nomination("dispatch", {"nomination_id": "nom-1", "route_id": "pool-a-b", "shipper_id": "household", "service_date": "2026-09-25", "requested_mu": "80000", "priority": 10, "idempotency_key": "key-1"})
+        first = self.service.allocate("dispatch", "pool-a-b", "2026-09-25")
+        self.assertFalse(first["replayed"])
+        second = self.service.allocate("dispatch", "pool-a-b", "2026-09-25")
+        self.assertTrue(second["replayed"])
+        self.assertEqual(first["allocation_id"], second["allocation_id"])
+        self.assertEqual(first["available_capacity"], second["available_capacity"])
+        self.assertEqual(first["allocations"], second["allocations"])
+        runs = self.connection.execute("SELECT * FROM allocation_runs").fetchall()
+        self.assertEqual(len(runs), 1)
+        self.service.announce_outage("risk", "pool-a-b", "2026-09-25T00:00:00Z", "2026-09-25T06:00:00Z", "50", "临时停用")
+        with self.assertRaises(Conflict):
+            self.service.allocate("dispatch", "pool-a-b", "2026-09-25")
+        stored = self.connection.execute("SELECT available_capacity FROM allocation_runs").fetchone()
+        self.assertEqual(stored["available_capacity"], first["available_capacity"])
+
+    def test_facility_rejects_unknown_timezone(self) -> None:
+        with self.assertRaises(ValidationFailed):
+            self.service.create_facility("plan", {"facility_id": "nowhere", "name": "未知片区", "kind": "storage", "timezone": "Mars/Olympus", "capacity_mu": "1"})
+
+    def test_api_capacity_preview_matches_batch_allocation(self) -> None:
+        app = JsonApplication(self.service)
+        self.service.announce_outage("risk", "pool-a-b", "2026-09-24T15:00:00Z", "2026-09-24T17:00:00Z", "0", "跨午夜停用")
+        self.service.submit_nomination("dispatch", {"nomination_id": "nom-1", "route_id": "pool-a-b", "shipper_id": "household", "service_date": "2026-09-25", "requested_mu": "80000", "priority": 10, "idempotency_key": "key-1"})
+        preview = app.handle("GET", "/routes/pool-a-b/capacity?service_date=2026-09-25", {"X-Actor-Id": "dispatch"})
+        self.assertEqual(preview.status, 200)
+        allocation = self.service.allocate("dispatch", "pool-a-b", "2026-09-25")
+        # 群众白天查询到的可选额度与夜间批量分配结果一致
+        self.assertEqual(preview.body["available_capacity"], allocation["available_capacity"])
+        self.assertEqual(preview.body["nominal_capacity"], allocation["nominal_capacity"])
+        self.assertEqual(preview.body["outages"], allocation["outages"])
 
     def test_scenario_is_approved_and_replayed_by_input(self) -> None:
         self.quote(23, "98")

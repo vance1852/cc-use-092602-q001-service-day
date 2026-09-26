@@ -8,19 +8,22 @@ import sqlite3
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any, Iterable, Mapping
+from zoneinfo import ZoneInfoNotFoundError
 
 from .clock import SystemClock, parse_utc, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario
+from .models import IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario, date_text
 from .planning import (
     AllocationRequest,
+    OutageWindow,
     PricePoint,
     allocate_capacity,
+    business_day_window,
     canonical_json,
+    daily_capacity_breakdown,
     decimal_text,
     delivered_after_loss,
     digest,
-    effective_capacity,
     latest_streak,
     moving_average,
     quantize_volume,
@@ -345,28 +348,88 @@ class SupplyService:
             raise Conflict("提名编号或幂等键冲突") from exc
         return response
 
-    def _capacity_for_date(self, route: sqlite3.Row, service_date: str) -> Decimal:
-        start = service_date + "T00:00:00Z"
-        end = service_date + "T23:59:59Z"
+    def _route_timezone(self, route: sqlite3.Row) -> str:
+        row = self.connection.execute(
+            "SELECT timezone FROM facilities WHERE facility_id=?", (route["destination_id"],)
+        ).fetchone()
+        return "UTC" if row is None else row["timezone"]
+
+    def _capacity_breakdown(self, route: sqlite3.Row, service_date: str) -> dict[str, Any]:
+        timezone_name = self._route_timezone(route)
+        try:
+            day_start, day_end = business_day_window(timezone_name, service_date)
+        except ZoneInfoNotFoundError as exc:
+            raise ValidationFailed(f"安置片区时区 {timezone_name} 不在时区数据库中") from exc
         rows = self.connection.execute(
-            "SELECT capacity_percent FROM route_outages WHERE route_id=? AND state IN ('announced','active') "
-            "AND starts_at<=? AND (ends_at IS NULL OR ends_at>=?) ORDER BY outage_id",
-            (route["route_id"], end, start),
+            "SELECT outage_id,starts_at,ends_at,capacity_percent FROM route_outages "
+            "WHERE route_id=? AND state IN ('announced','active') ORDER BY outage_id",
+            (route["route_id"],),
         ).fetchall()
-        percentages = [Decimal(row["capacity_percent"]) for row in rows]
-        return effective_capacity(Decimal(route["daily_capacity"]), percentages)
+        outages = [
+            OutageWindow(
+                int(row["outage_id"]),
+                parse_utc(row["starts_at"], "starts_at"),
+                None if row["ends_at"] is None else parse_utc(row["ends_at"], "ends_at"),
+                Decimal(row["capacity_percent"]),
+            )
+            for row in rows
+        ]
+        breakdown = daily_capacity_breakdown(Decimal(route["daily_capacity"]), outages, day_start, day_end)
+        return {
+            "timezone": timezone_name,
+            "business_day_starts_at": utc_text(day_start),
+            "business_day_ends_at": utc_text(day_end),
+            **breakdown,
+        }
+
+    def capacity_preview(self, actor_id: str, route_id: str, service_date: str) -> dict[str, Any]:
+        self._user(actor_id)
+        route = self.connection.execute("SELECT * FROM routes WHERE route_id=?", (route_id,)).fetchone()
+        if route is None:
+            raise NotFound("地块资源池不存在")
+        day = date_text(service_date, "service_date")
+        return {"route_id": route_id, "service_date": day, **self._capacity_breakdown(route, day)}
 
     def allocate(self, actor_id: str, route_id: str, service_date: str) -> dict[str, Any]:
         self._require(actor_id, "allocation.run")
         route = self.connection.execute("SELECT * FROM routes WHERE route_id=?", (route_id,)).fetchone()
         if route is None:
             raise NotFound("地块资源池不存在")
+        day = date_text(service_date, "service_date")
+        capacity = self._capacity_breakdown(route, day)
+        available = Decimal(capacity["available_capacity"])
         nominations = self.connection.execute(
-            "SELECT * FROM nominations WHERE route_id=? AND service_date=? AND state='submitted' "
+            "SELECT * FROM nominations WHERE route_id=? AND service_date=? "
             "ORDER BY priority,submitted_at,nomination_id",
-            (route_id, service_date),
+            (route_id, day),
         ).fetchall()
-        if not nominations:
+        input_sha256 = digest({
+            "route_id": route_id,
+            "service_date": day,
+            "capacity": capacity,
+            "nominations": [
+                {
+                    "nomination_id": row["nomination_id"],
+                    "shipper_id": row["shipper_id"],
+                    "requested_mu": row["requested_mu"],
+                    "priority": row["priority"],
+                    "submitted_at": row["submitted_at"],
+                }
+                for row in nominations
+            ],
+        })
+        confirmed = self.connection.execute(
+            "SELECT allocation_id,input_sha256,result_json FROM allocation_runs "
+            "WHERE route_id=? AND service_date=? ORDER BY allocation_id",
+            (route_id, day),
+        ).fetchall()
+        for run in confirmed:
+            if run["input_sha256"] == input_sha256:
+                return {"allocation_id": run["allocation_id"], **json.loads(run["result_json"]), "replayed": True}
+        if confirmed:
+            raise Conflict("该分配日已存在确认的分配结果，登记输入发生变化，拒绝重新核算改写历史")
+        submitted = [row for row in nominations if row["state"] == "submitted"]
+        if not submitted:
             raise InvalidState("没有待分配提名")
         requests = [
             AllocationRequest(
@@ -375,23 +438,20 @@ class SupplyService:
                 int(row["priority"]),
                 row["submitted_at"],
             )
-            for row in nominations
+            for row in submitted
         ]
-        available = self._capacity_for_date(route, service_date)
-        input_value = [dict(row) for row in nominations]
-        input_sha256 = digest({"route": dict(route), "nominations": input_value, "capacity": str(available)})
         result_rows = allocate_capacity(available, requests)
         result = {
             "route_id": route_id,
-            "service_date": service_date,
-            "available_capacity": decimal_text(available),
+            "service_date": day,
+            **capacity,
             "allocations": result_rows,
         }
         with transaction(self.connection, immediate=True):
             cursor = self.connection.execute(
                 "INSERT INTO allocation_runs(route_id,service_date,input_sha256,available_capacity,result_json,"
                 "created_by,created_at) VALUES(?,?,?,?,?,?,?)",
-                (route_id, service_date, input_sha256, decimal_text(available), canonical_json(result), actor_id, self._now()),
+                (route_id, day, input_sha256, decimal_text(available), canonical_json(result), actor_id, self._now()),
             )
             for item in result_rows:
                 state = "allocated" if Decimal(item["allocated_mu"]) > 0 else "cancelled"
@@ -402,7 +462,7 @@ class SupplyService:
                 )
             allocation_id = int(cursor.lastrowid)
             self._audit("route", route_id, "allocation.completed", actor_id, {"allocation_id": allocation_id})
-        return {"allocation_id": allocation_id, **result}
+        return {"allocation_id": allocation_id, **result, "replayed": False}
 
     def dispatch_transfer(
         self,

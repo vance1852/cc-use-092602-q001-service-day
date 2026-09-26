@@ -27,10 +27,22 @@ def run(workspace: Path) -> dict[str, object]:
     service.submit_nomination("dispatch", {"nomination_id": "nom-001", "route_id": "pool-a-b", "shipper_id": "household-east", "service_date": "2026-09-25", "requested_mu": "80000", "priority": 10, "idempotency_key": "nom-key-001"})
     allocation = service.allocate("dispatch", "pool-a-b", "2026-09-25")
     transfer = service.dispatch_transfer("dispatch", "transfer-001", "nom-001", "lot-001", 2)
+    # 西部跨县安置：喀什安置片区（Asia/Urumqi）当地午夜前后的跨日地块临时停用
+    service.create_facility("plan", {"facility_id": "kashgar-settlement", "name": "喀什安置片区", "kind": "settlement", "timezone": "Asia/Urumqi", "capacity_mu": "600000"})
+    service.create_route("plan", {"route_id": "pool-a-kashgar", "origin_id": "village-a", "destination_id": "kashgar-settlement", "product": "cultivated-land", "daily_capacity": "24000", "loss_basis_points": 10, "transit_hours": 48})
+    service.announce_outage("risk", "pool-a-kashgar", "2026-09-24T17:00:00Z", "2026-09-24T19:00:00Z", "0", "当地午夜前后地块临时停用")
+    service.submit_nomination("dispatch", {"nomination_id": "nom-002", "route_id": "pool-a-kashgar", "shipper_id": "household-west", "service_date": "2026-09-25", "requested_mu": "20000", "priority": 10, "idempotency_key": "nom-key-002"})
+    capacity = service.capacity_preview("dispatch", "pool-a-kashgar", "2026-09-25")
+    kashgar_allocation = service.allocate("dispatch", "pool-a-kashgar", "2026-09-25")
+    replay = service.allocate("dispatch", "pool-a-kashgar", "2026-09-25")
+    if capacity["available_capacity"] != kashgar_allocation["available_capacity"]:
+        raise RuntimeError("白天查询额度与夜间批量分配结果不一致")
+    if not replay["replayed"] or replay["allocation_id"] != kashgar_allocation["allocation_id"]:
+        raise RuntimeError("重复核算未返回稳定结果")
     service.create_scenario("plan", {"scenario_id": "relocation-recovery", "name": "关键机组检修恢复与需求回落", "market_index_drop_percent": "9", "route_capacity_changes": {"pool-a-b": "20"}, "demand_changes": {"village-a:cultivated-land": "-5"}})
     service.approve_scenario("risk", "relocation-recovery", 1)
     scenario = service.run_scenario("plan", "relocation-recovery", "2026-09-23")
-    result = {"status": "ok", "price": service.price_summary("PEAK_VALLEY"), "allocation_id": allocation["allocation_id"], "transfer": transfer, "scenario_run_id": scenario["run_id"], "audit": service.audit_chain("audit"), "workspace": workspace.name}
+    result = {"status": "ok", "price": service.price_summary("PEAK_VALLEY"), "allocation_id": allocation["allocation_id"], "transfer": transfer, "capacity": capacity, "kashgar_allocation_id": kashgar_allocation["allocation_id"], "kashgar_replayed": replay["replayed"], "scenario_run_id": scenario["run_id"], "audit": service.audit_chain("audit"), "workspace": workspace.name}
     connection.close()
     return result
 

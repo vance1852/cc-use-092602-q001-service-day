@@ -5,8 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Iterable, Mapping, Sequence
+from zoneinfo import ZoneInfo
+
+from .clock import utc_text
 
 
 ZERO = Decimal("0")
@@ -111,6 +115,75 @@ def effective_capacity(
         bounded = max(ZERO, min(HUNDRED, percentage))
         result *= bounded / HUNDRED
     return quantize_volume(result)
+
+
+@dataclass(frozen=True, slots=True)
+class OutageWindow:
+    """一条地块临时限制时段；ends_at 为 None 表示未填写结束时间、持续生效。"""
+
+    outage_id: int
+    starts_at: datetime
+    ends_at: datetime | None
+    capacity_percent: Decimal
+
+
+def business_day_window(timezone_name: str, service_date: str) -> tuple[datetime, datetime]:
+    """返回业务日在 UTC 下的起止时刻。
+
+    业务日边界跟随安置片区时区的当地午夜（含夏令时引起的 23/25 小时日），
+    使临时限制时段与乡镇采用的自然日口径保持一致。
+    """
+    zone = ZoneInfo(timezone_name)
+    day = date.fromisoformat(service_date)
+    start_local = datetime.combine(day, time.min).replace(tzinfo=zone)
+    end_local = datetime.combine(day + timedelta(days=1), time.min).replace(tzinfo=zone)
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
+
+def _duration_seconds(delta: timedelta) -> Decimal:
+    return Decimal(delta.days * 86400 + delta.seconds) + Decimal(delta.microseconds) / Decimal(1000000)
+
+
+def daily_capacity_breakdown(
+    nominal: Decimal,
+    outages: Iterable[OutageWindow],
+    day_start: datetime,
+    day_end: datetime,
+) -> dict[str, object]:
+    """按业务日窗口折算可分配容量，并逐段解释每条限制的重叠扣减贡献。
+
+    跨日限制只按与业务日真正重叠的时长比例扣减；未填写结束时间的限制
+    持续生效；同一输入重复核算返回稳定结果。
+    """
+    day_seconds = _duration_seconds(day_end - day_start)
+    if day_seconds <= ZERO:
+        raise ValueError("业务日窗口必须为正")
+    rows: list[dict[str, object]] = []
+    total_deduction = ZERO
+    for outage in sorted(outages, key=lambda item: item.outage_id):
+        overlap_start = max(outage.starts_at, day_start)
+        overlap_end = day_end if outage.ends_at is None else min(outage.ends_at, day_end)
+        if overlap_end <= overlap_start:
+            continue
+        bounded = max(ZERO, min(HUNDRED, outage.capacity_percent))
+        overlap_seconds = _duration_seconds(overlap_end - overlap_start)
+        deducted = quantize_volume(nominal * (HUNDRED - bounded) / HUNDRED * overlap_seconds / day_seconds)
+        total_deduction += deducted
+        rows.append({
+            "outage_id": outage.outage_id,
+            "capacity_percent": decimal_text(bounded),
+            "overlap_starts_at": utc_text(overlap_start),
+            "overlap_ends_at": utc_text(overlap_end),
+            "overlap_seconds": decimal_text(overlap_seconds),
+            "deducted_mu": decimal_text(deducted),
+        })
+    available = quantize_volume(max(ZERO, nominal - total_deduction))
+    return {
+        "nominal_capacity": decimal_text(quantize_volume(nominal)),
+        "deducted_capacity": decimal_text(quantize_volume(total_deduction)),
+        "available_capacity": decimal_text(available),
+        "outages": rows,
+    }
 
 
 @dataclass(frozen=True, slots=True)
