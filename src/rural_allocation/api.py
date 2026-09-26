@@ -75,6 +75,15 @@ class JsonApplication:
                 return Response(201, self.service.submit_nomination(actor, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "routes" and parts[2] == "allocate":
                 return Response(200, self.service.allocate(actor, parts[1], payload["service_date"]))
+            if method == "GET" and len(parts) == 3 and parts[0] == "routes" and parts[2] == "capacity":
+                return Response(
+                    200,
+                    self.service.capacity_breakdown(
+                        actor, parts[1], query.get("service_date", [""])[0]
+                    ),
+                )
+            if method == "GET" and len(parts) == 2 and parts[0] == "allocations":
+                return Response(200, self.service.allocation_run(actor, int(parts[1])))
             if method == "POST" and path == "/transfers":
                 return Response(201, self.service.dispatch_transfer(actor, payload["transfer_id"], payload["nomination_id"], payload["lot_id"], int(payload["expected_revision"])))
             if method == "POST" and path == "/scenarios":

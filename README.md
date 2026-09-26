@@ -47,3 +47,27 @@ PYTHONPATH=src python3 -m remediation_review.api --database remediation.sqlite3 
 ```
 
 服务均提供 `GET /health`，其余接口使用 JSON。账号登录和角色权限由服务端校验，进程重启后可以继续查询 SQLite 中的业务状态与审计历史。
+
+## 分配日容量口径
+
+乡镇分配日（业务日）按**安置片区（地块资源池终点设施）所在的 IANA 时区**和该乡镇登记的
+`business_day_boundary`（默认 `00:00`，即本地午夜切日）换算为 UTC 半开区间 `[起, 止)`，
+而不是 UTC 自然日。因此在喀什（`Asia/Urumqi`）或西安本地午夜附近登记的临时停用，
+不会被拆进不同的 UTC 自然日重复或遗漏。
+
+容量按时间积分：
+
+- 每段临时停用（`route_outages`）只扣减它与该业务日**真正重叠**的时段，比例为
+  `(1 - capacity_percent/100) × 重叠时长/业务日时长`；同一时刻多段限制重叠时连乘。
+- 未填写 `ends_at` 的限制自 `starts_at` 起持续生效（之后的业务日整日受限）。
+- 核算结果只依赖限制内容并按编号稳定排序，重复核算、乱序输入结果一致。
+- 已确认的分配运行结果原样落库（含容量明细），事后新增或修改限制不会静默改写历史结果。
+
+查询与解释接口：
+
+- `GET /routes/{route_id}/capacity?service_date=YYYY-MM-DD`：返回原始容量
+  `nominal_capacity`、业务日 UTC 窗口、每段限制的 `overlap_seconds/overlap_share/deducted_capacity`
+  与最终 `available_capacity`，供群众白天查询与人工核对。
+- `GET /allocations/{allocation_id}`：返回已确认分配运行的最终结果及当时的容量明细快照。
+
+登记设施时可通过 `business_day_boundary`（`HH:MM`）指定乡镇采用的业务日切日时刻。

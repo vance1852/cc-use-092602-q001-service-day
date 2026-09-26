@@ -104,6 +104,7 @@ class Facility:
     kind: str
     timezone: str
     capacity_mu: Decimal
+    business_day_boundary: str = "00:00"
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "Facility":
@@ -113,6 +114,15 @@ class Facility:
         timezone = required_text(raw.get("timezone"), "timezone", 64)
         if "/" not in timezone and timezone != "UTC":
             raise ValidationFailed("timezone 必须是 IANA 时区或 UTC")
+        boundary_text = raw.get("business_day_boundary", "00:00")
+        boundary = required_text(boundary_text, "business_day_boundary", 5)
+        try:
+            hour_text, minute_text = boundary.split(":")
+            hour, minute = int(hour_text), int(minute_text)
+            if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+                raise ValueError
+        except (ValueError, TypeError) as exc:
+            raise ValidationFailed("business_day_boundary 必须是 HH:MM") from exc
         return cls(
             facility_id=identifier(raw.get("facility_id"), "facility_id"),
             name=required_text(raw.get("name"), "name"),
@@ -121,6 +131,7 @@ class Facility:
             capacity_mu=decimal_value(
                 raw.get("capacity_mu"), "capacity_mu", minimum=Decimal("0")
             ),
+            business_day_boundary=f"{hour:02d}:{minute:02d}",
         )
 
 
